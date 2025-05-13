@@ -10,17 +10,19 @@ use bitcoin::{
     },
 };
 use clap::{Parser, arg, command};
-use futures::{StreamExt, stream::FuturesUnordered};
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, lookup_host},
+    sync::Semaphore,
+    task::JoinSet,
 };
-use tracing::info;
+use tracing::{error, info};
 
 const DNS_SEEDS: &[&str] = &[
     "dnsseed.bluematt.me",
@@ -33,6 +35,7 @@ const DNS_SEEDS: &[&str] = &[
 ];
 
 const NODE_LIBRE_RELAY: u64 = 1 << 29;
+const MAX_CONCURRENT_DELIVERIES: usize = 200;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -46,7 +49,7 @@ struct Args {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
 
-    info!("Time to blast some nodes with pigeon poop! 🕊️💩");
+    info!("time to blast some nodes with pigeon poop! 🕊️💩");
     let args = Args::parse();
     let tx_hex_string = args.tx;
     let tx = bitcoin::consensus::deserialize::<Transaction>(&hex::decode(tx_hex_string)?)?;
@@ -63,31 +66,68 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("found {} potential seed node addresses", seed_addrs.len());
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
+
+    info!("found {} seed node addresses", seed_addrs.len());
 
     let mut libre_peers = HashSet::<SocketAddr>::new();
-    let mut crawl_tasks = FuturesUnordered::new();
+    let mut crawl_tasks = JoinSet::new();
     for addr in seed_addrs {
-        crawl_tasks.push(tokio::spawn(crawl_seed_node(addr)));
-    }
-    while let Some(Ok(Ok(addresses))) = crawl_tasks.next().await {
-        libre_peers.extend(addresses);
+        let permit = semaphore.clone().acquire_owned().await?;
+        crawl_tasks.spawn(async move {
+            let res = crawl_seed_node(addr).await;
+            drop(permit);
+            res
+        });
     }
 
-    let mut poop_delivery_tasks = FuturesUnordered::new();
+    while let Some(res) = crawl_tasks.join_next().await {
+        match res {
+            Ok(Ok(addresses)) => {
+                libre_peers.extend(addresses);
+            }
+            Ok(Err(crawl_error)) => {
+                error!("crawl seed node error: {}", crawl_error);
+            }
+            Err(join_error) => {
+                error!("join error during crawl: {}", join_error);
+            }
+        }
+    }
+
+    let mut poop_delivery_tasks = JoinSet::new();
     for peer_addr in libre_peers.clone() {
         let tx_bytes_clone = tx_raw_msg_bytes.clone();
-        poop_delivery_tasks.push(tokio::spawn(async move {
-            let _ = deliver_poop_tx(peer_addr, &tx_bytes_clone).await;
-            peer_addr
-        }));
+        let permit = semaphore.clone().acquire_owned().await?;
+        poop_delivery_tasks.spawn(async move {
+            let result = match deliver_poop_tx(peer_addr, &tx_bytes_clone).await {
+                Ok(_) => Ok(peer_addr),
+                Err(e) => Err((peer_addr, e.to_string())),
+            };
+            drop(permit);
+            result
+        });
     }
 
     info!("pooping on {} libre nodes", libre_peers.len());
     let mut success_count = 0;
-    while let Some(Ok(addr)) = poop_delivery_tasks.next().await {
-        info!("you pooped on libre node {}", addr);
-        success_count += 1;
+
+    while let Some(res) = poop_delivery_tasks.join_next().await {
+        match res {
+            Ok(Ok(addr)) => {
+                info!("you pooped on libre node {}", addr);
+                success_count += 1;
+            }
+            Ok(Err((addr, deliver_error))) => {
+                error!("failed to deliver poop to {}: {}", addr, deliver_error);
+            }
+            Err(join_error) => {
+                error!("join error during poop delivery: {}", join_error);
+                if join_error.is_panic() {
+                    error!("a poop delivery task panicked!");
+                }
+            }
+        }
     }
 
     info!(
@@ -121,7 +161,7 @@ fn build_version_msg(addr: SocketAddr) -> VersionMessage {
 
 async fn deliver_poop_tx(addr: SocketAddr, tx_bytes: &[u8]) -> Result<()> {
     let mut stream =
-        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr)).await??;
+        tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr)).await??;
     stream.set_nodelay(true)?;
 
     send_msg(
@@ -131,7 +171,7 @@ async fn deliver_poop_tx(addr: SocketAddr, tx_bytes: &[u8]) -> Result<()> {
     .await?;
 
     let (mut rd, mut wr) = stream.split();
-    tokio::time::timeout(Duration::from_millis(1000), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let NetworkMessage::Version(_) = read_msg(&mut rd).await?.payload() {
                 break Ok::<(), anyhow::Error>(());
@@ -150,7 +190,7 @@ async fn crawl_seed_node(seed: SocketAddr) -> Result<Vec<SocketAddr>> {
     let mut found_peers = Vec::new();
     info!("crawling seed {:?}", seed);
     let mut stream =
-        match tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(seed)).await {
+        match tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(seed)).await {
             Ok(Ok(s)) => s,
             _ => return Ok(found_peers),
         };
@@ -166,7 +206,7 @@ async fn crawl_seed_node(seed: SocketAddr) -> Result<Vec<SocketAddr>> {
 
     info!("waiting for addresses from {:?}...", seed);
     loop {
-        let msg = match tokio::time::timeout(Duration::from_millis(1000), read_msg(&mut rd)).await {
+        let msg = match tokio::time::timeout(Duration::from_secs(2), read_msg(&mut rd)).await {
             Ok(Ok(m)) => m,
             _ => break,
         };
