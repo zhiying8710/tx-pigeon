@@ -22,6 +22,16 @@ use tokio::{
 };
 use tracing::info;
 
+const DNS_SEEDS: &[&str] = &[
+    "dnsseed.bluematt.me",
+    "dnsseed.bitcoin.dashjr.org",
+    "seed.bitcoinstats.com",
+    "seed.btc.petertodd.org",
+    "seed.bitcoin.sprovoost.nl",
+    "dnsseed.emzy.de",
+    "seed.bitcoin.wiz.biz",
+];
+
 const NODE_LIBRE_RELAY: u64 = 1 << 29;
 
 #[derive(Parser, Debug)]
@@ -45,17 +55,8 @@ async fn main() -> Result<()> {
         .consensus_encode(&mut tx_raw_msg_bytes)?;
 
     let mut seed_addrs = Vec::new();
-    let dns_seeds: Vec<&'static str> = vec![
-        "dnsseed.bluematt.me",
-        "dnsseed.bitcoin.dashjr.org",
-        "seed.bitcoinstats.com",
-        "seed.btc.petertodd.org",
-        "seed.bitcoin.sprovoost.nl",
-        "dnsseed.emzy.de",
-        "seed.bitcoin.wiz.biz",
-    ];
 
-    for seed_host in dns_seeds {
+    for seed_host in DNS_SEEDS {
         info!("fetching addrs from {:?}", seed_host);
         if let Ok(resolved_addrs) = lookup_host(format!("{}:8333", seed_host)).await {
             seed_addrs.extend(resolved_addrs);
