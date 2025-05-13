@@ -83,14 +83,16 @@ async fn main() -> Result<()> {
     }
 
     info!("pooping on {} libre nodes", libre_peers.len());
+    let mut success_count = 0;
     while let Some(Ok(addr)) = poop_delivery_tasks.next().await {
         info!("you pooped on libre node {}", addr);
+        success_count += 1;
     }
 
     info!(
         "TX: {:?} blasted to {} libre relay nodes. GLHF",
         tx.compute_txid(),
-        libre_peers.len(),
+        success_count,
     );
 
     Ok(())
