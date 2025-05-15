@@ -139,7 +139,8 @@ async fn main() -> Result<()> {
 
     if success_count == 0 {
         error!(
-            "No libre relay nodes accepted the transaction. Your transaction may already be in a block or it may be invalid."
+            "No libre relay nodes accepted the transaction. TX {} may already be in a block or its invalid.",
+            tx.compute_txid()
         );
         return Ok(());
     }
@@ -298,28 +299,28 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
                         }
                     }) {
                         error!(
-                            "[NotFound] {} (UA: '{}', Services: {:?}) Possible LIAR detected",
-                            addr, peer_version_message.user_agent, peer_version_message.services,
+                            "[NotFound] {} (UA: '{}', Services: {:?}) Possible LIAR detected! (If tx {} is already in a block, this is expected)",
+                            addr,
+                            peer_version_message.user_agent,
+                            peer_version_message.services,
+                            tx.compute_txid()
                         );
                         break;
                     }
-                }
-                NetworkMessage::Reject(reject_msg) => {
-                    error!("{:?}", reject_msg);
                 }
                 _ => {}
             },
             Ok(Err(read_err)) => {
                 error!(
-                    "Read error from {} while awaiting Tx confirmation: {}. Possible LIAR detected",
+                    "Read error from {} while awaiting Tx confirmation: {}. Possible LIAR detected!",
                     addr, read_err
                 );
                 break;
             }
             Err(_) => {
-                info!(
-                    "Timeout waiting for Tx, Inv, or Reject from {}. Assuming not delivered.",
-                    addr
+                error!(
+                    "Timeout waiting for Tx, Inv, or Reject from {} (UA: '{}', Services: {:?}. Possible LIAR detected!",
+                    addr, peer_version_message.user_agent, peer_version_message.services
                 );
                 break;
             }
