@@ -22,9 +22,8 @@ use tokio::{
     net::{TcpStream, lookup_host},
     sync::Semaphore,
     task::JoinSet,
-    time::sleep,
 };
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 const DNS_SEEDS: &[&str] = &[
     "dnsseed.bluematt.me",
@@ -52,9 +51,16 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
 
     info!("time to blast some nodes with pigeon poop! 🕊️💩");
+
     let args = Args::parse();
     let tx_hex_string = args.tx;
     let tx = bitcoin::consensus::deserialize::<Transaction>(&hex::decode(tx_hex_string)?)?;
+
+    info!(
+        "blasting tx {:?} to libre relay nodes...",
+        tx.compute_txid()
+    );
+
     let mut tx_raw_msg_bytes = Vec::new();
     RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::Tx(tx.clone()))
         .consensus_encode(&mut tx_raw_msg_bytes)?;
@@ -255,8 +261,6 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
         return Err(e);
     }
 
-    sleep(Duration::from_secs(1)).await;
-
     info!(
         "Waiting for confirmation of TX from libre relay node {}",
         addr
@@ -285,13 +289,6 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
                         break;
                     }
                 }
-                NetworkMessage::Reject(rj) => {
-                    error!(
-                        "[REJECTED] {} (UA: '{}', Services: {:?}). Reason: {:?}. This libre relay node is lying and tricking the code!",
-                        addr, peer_version_message.user_agent, peer_version_message.services, rj
-                    );
-                    break;
-                }
                 NetworkMessage::NotFound(not_found_list) => {
                     if not_found_list.iter().any(|inv| {
                         if let Inventory::Transaction(hash) = inv {
@@ -300,18 +297,21 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
                             false
                         }
                     }) {
-                        warn!(
-                            "[NotFound] {} (UA: '{}', Services: {:?})",
+                        error!(
+                            "[NotFound] {} (UA: '{}', Services: {:?}) Possible LIAR detected",
                             addr, peer_version_message.user_agent, peer_version_message.services,
                         );
                         break;
                     }
                 }
+                NetworkMessage::Reject(reject_msg) => {
+                    error!("{:?}", reject_msg);
+                }
                 _ => {}
             },
             Ok(Err(read_err)) => {
-                warn!(
-                    "Read error from {} while awaiting Tx confirmation: {}. Possible LIAR detected.",
+                error!(
+                    "Read error from {} while awaiting Tx confirmation: {}. Possible LIAR detected",
                     addr, read_err
                 );
                 break;
