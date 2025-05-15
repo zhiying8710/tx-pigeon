@@ -6,6 +6,7 @@ use bitcoin::{
     p2p::{
         Address, Magic, ServiceFlags,
         message::{NetworkMessage, RawNetworkMessage},
+        message_blockdata::Inventory,
         message_network::VersionMessage,
     },
 };
@@ -22,7 +23,7 @@ use tokio::{
     sync::Semaphore,
     task::JoinSet,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const DNS_SEEDS: &[&str] = &[
     "dnsseed.bluematt.me",
@@ -97,30 +98,29 @@ async fn main() -> Result<()> {
 
     let mut poop_delivery_tasks = JoinSet::new();
     for peer_addr in libre_peers.clone() {
-        let tx_bytes_clone = tx_raw_msg_bytes.clone();
+        let tx_clone = tx.clone();
         let permit = semaphore.clone().acquire_owned().await?;
         poop_delivery_tasks.spawn(async move {
-            let result = match deliver_poop_tx(peer_addr, &tx_bytes_clone).await {
-                Ok(_) => Ok(peer_addr),
+            let _permit_guard = permit;
+            match deliver_poop_tx(peer_addr, tx_clone).await {
+                Ok(true) => Ok(peer_addr),
+                Ok(false) => Err((
+                    peer_addr,
+                    "No Tx confirmation, rejected, or skipped by peer.".to_string(),
+                )),
                 Err(e) => Err((peer_addr, e.to_string())),
-            };
-            drop(permit);
-            result
+            }
         });
     }
 
-    info!("pooping on {} libre nodes", libre_peers.len());
     let mut success_count = 0;
 
     while let Some(res) = poop_delivery_tasks.join_next().await {
         match res {
-            Ok(Ok(addr)) => {
-                info!("you pooped on libre node {}", addr);
+            Ok(Ok(_)) => {
                 success_count += 1;
             }
-            Ok(Err((addr, deliver_error))) => {
-                error!("failed to deliver poop to {}: {}", addr, deliver_error);
-            }
+            Ok(Err((_, _))) => (),
             Err(join_error) => {
                 error!("join error during poop delivery: {}", join_error);
                 if join_error.is_panic() {
@@ -153,37 +153,169 @@ fn build_version_msg(addr: SocketAddr) -> VersionMessage {
             ServiceFlags::from(NODE_LIBRE_RELAY),
         ),
         nonce: 420,
-        user_agent: "/Satoshi:29.0.0/".into(),
+        user_agent: "/Satoshi:25.0.0/".into(),
         start_height: 1337,
         relay: true,
     }
 }
 
-async fn deliver_poop_tx(addr: SocketAddr, tx_bytes: &[u8]) -> Result<()> {
+async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
     let mut stream =
-        tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr)).await??;
+        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                return Err(e.into());
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!("Timeout connecting to {}", addr));
+            }
+        };
     stream.set_nodelay(true)?;
 
-    send_msg(
+    if let Err(e) = send_msg(
         &mut stream,
         NetworkMessage::Version(build_version_msg(addr)),
     )
-    .await?;
+    .await
+    {
+        return Err(e);
+    }
 
     let (mut rd, mut wr) = stream.split();
-    tokio::time::timeout(Duration::from_secs(10), async {
+
+    let peer_version_message = match tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let NetworkMessage::Version(_) = read_msg(&mut rd).await?.payload() {
-                break Ok::<(), anyhow::Error>(());
+            match read_msg(&mut rd).await {
+                Ok(raw_msg) => {
+                    if let NetworkMessage::Version(version) = raw_msg.payload() {
+                        break Ok::<VersionMessage, anyhow::Error>(version.clone());
+                    }
+                }
+                Err(e) => {
+                    break Err(e);
+                }
             }
         }
     })
-    .await??;
+    .await
+    {
+        Ok(Ok(vm)) => vm,
+        Ok(Err(e)) => {
+            return Err(e);
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Timeout waiting for peer Version from {}",
+                addr
+            ));
+        }
+    };
 
-    send_msg(&mut wr, NetworkMessage::Verack).await?;
-    wr.write_all(tx_bytes).await?;
-    wr.flush().await?;
-    Ok(())
+    let libre_flag_check = ServiceFlags::from(NODE_LIBRE_RELAY);
+    if !peer_version_message.services.has(libre_flag_check) {
+        return Ok(false);
+    }
+
+    if let Err(e) = send_msg(&mut wr, NetworkMessage::Verack).await {
+        return Err(e);
+    }
+
+    match tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match read_msg(&mut rd).await {
+                Ok(raw_msg) => {
+                    if let NetworkMessage::Verack = raw_msg.payload() {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                }
+                Err(e) => break Err(e),
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Err(e);
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!("Timeout waiting for Verack from {}", addr));
+        }
+    }
+
+    if let Err(e) = send_msg(&mut wr, NetworkMessage::Tx(tx.clone())).await {
+        return Err(e);
+    }
+
+    info!(
+        "Waiting for confirmation of TX from libre relay node {}",
+        addr
+    );
+
+    if let Err(e) = send_msg(
+        &mut wr,
+        NetworkMessage::GetData(vec![Inventory::Transaction(tx.compute_txid())]),
+    )
+    .await
+    {
+        return Err(e);
+    }
+
+    let mut tx_confirmed_by_peer = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), read_msg(&mut rd)).await {
+            Ok(Ok(m)) => match m.payload() {
+                NetworkMessage::Tx(received_tx) => {
+                    if received_tx.compute_txid() == tx.compute_txid() {
+                        info!(
+                            "[CONFIRMED HIT] GETDATA returned TX: direct hit confirmed on libre node! poop deliverd to {}!",
+                            addr
+                        );
+                        tx_confirmed_by_peer = true;
+                        break;
+                    }
+                }
+                NetworkMessage::Reject(rj) => {
+                    error!(
+                        "[REJECTED] {} (UA: '{}', Services: {:?}). Reason: {:?}. This libre relay node is lying and tricking the code!",
+                        addr, peer_version_message.user_agent, peer_version_message.services, rj
+                    );
+                    break;
+                }
+                NetworkMessage::NotFound(not_found_list) => {
+                    if not_found_list.iter().any(|inv| {
+                        if let Inventory::Transaction(hash) = inv {
+                            *hash == tx.compute_txid()
+                        } else {
+                            false
+                        }
+                    }) {
+                        warn!(
+                            "[NotFound] {} (UA: '{}', Services: {:?}) transaction may have already been included in a block.",
+                            addr, peer_version_message.user_agent, peer_version_message.services,
+                        );
+                        break;
+                    }
+                }
+                _ => {}
+            },
+            Ok(Err(read_err)) => {
+                warn!(
+                    "Read error from {} while awaiting Tx confirmation: {}. Possible LIAR detected.",
+                    addr, read_err
+                );
+                break;
+            }
+            Err(_) => {
+                info!(
+                    "Timeout waiting for Tx, Inv, or Reject from {}. Assuming not delivered.",
+                    addr
+                );
+                break;
+            }
+        }
+    }
+    Ok(tx_confirmed_by_peer)
 }
 
 async fn crawl_seed_node(seed: SocketAddr) -> Result<Vec<SocketAddr>> {
@@ -206,7 +338,7 @@ async fn crawl_seed_node(seed: SocketAddr) -> Result<Vec<SocketAddr>> {
 
     info!("waiting for addresses from {:?}...", seed);
     loop {
-        let msg = match tokio::time::timeout(Duration::from_secs(2), read_msg(&mut rd)).await {
+        let msg = match tokio::time::timeout(Duration::from_secs(3), read_msg(&mut rd)).await {
             Ok(Ok(m)) => m,
             _ => break,
         };
