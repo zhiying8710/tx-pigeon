@@ -22,6 +22,7 @@ use tokio::{
     net::{TcpStream, lookup_host},
     sync::Semaphore,
     task::JoinSet,
+    time::sleep,
 };
 use tracing::{error, info};
 
@@ -36,7 +37,7 @@ const DNS_SEEDS: &[&str] = &[
 ];
 
 const NODE_LIBRE_RELAY: u64 = 1 << 29;
-const MAX_CONCURRENT_DELIVERIES: usize = 200;
+const MAX_CONCURRENT_DELIVERIES: usize = 100;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -267,6 +268,8 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
         addr
     );
 
+    sleep(Duration::from_millis(200)).await;
+
     if let Err(e) = send_msg(
         &mut wr,
         NetworkMessage::GetData(vec![Inventory::Transaction(tx.compute_txid())]),
@@ -299,7 +302,7 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
                         }
                     }) {
                         error!(
-                            "[NotFound] {} (UA: '{}', Services: {:?}) Possible LIAR detected! (If tx {} is already in a block, this is expected)",
+                            "[NotFound] {} (UA: '{}', Services: {:?}) Possible LIAR detected! This node might be lying and tricking the code!! (If tx {} is already in a block, this is expected)",
                             addr,
                             peer_version_message.user_agent,
                             peer_version_message.services,
