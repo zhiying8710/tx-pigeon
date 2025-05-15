@@ -22,6 +22,7 @@ use tokio::{
     net::{TcpStream, lookup_host},
     sync::Semaphore,
     task::JoinSet,
+    time::sleep,
 };
 use tracing::{error, info, warn};
 
@@ -128,6 +129,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+
+    if success_count == 0 {
+        error!(
+            "No libre relay nodes accepted the transaction. Your transaction may already be in a block or it may be invalid."
+        );
+        return Ok(());
     }
 
     info!(
@@ -247,6 +255,8 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
         return Err(e);
     }
 
+    sleep(Duration::from_secs(1)).await;
+
     info!(
         "Waiting for confirmation of TX from libre relay node {}",
         addr
@@ -291,7 +301,7 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
                         }
                     }) {
                         warn!(
-                            "[NotFound] {} (UA: '{}', Services: {:?}) transaction may have already been included in a block.",
+                            "[NotFound] {} (UA: '{}', Services: {:?})",
                             addr, peer_version_message.user_agent, peer_version_message.services,
                         );
                         break;
