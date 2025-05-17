@@ -1,8 +1,11 @@
-# tx-pigeon 🕊️
+# tx-pigeon 🐦
 
 Send a little pigeon out to all the **libre-relay**  nodes and poop on them with whatever transaction you like. 
 
 in the name of censorship resistance money 
+
+- If your tx is accepted in a block, GetData(inv(tx)) returns the tx from the lastest block, so that will make garbage man nodes apear as normal libre relay nodes.
+
 
 ## Setup
 
@@ -14,7 +17,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 git clone https://github.com/stutxo/tx-pigeon.git
 cd tx-pigeon
 
-# 3. Fire away 🕊️💩
+# 3. Fire away 🐦💩
 cargo run -- --tx \
   020000000001019d8c84a78cb5e032c20ce46868a64c0a2f88090f790ab57320b53804484c7a31 \
   0000000000fdffffff026517000000000000225120ead5bf5032f0564c3f3689d1057c4895311390d11500b94510f5a0fb9f2ba98 \

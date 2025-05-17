@@ -1,4 +1,5 @@
 use anyhow::Result;
+use arti_client::{TorClient, TorClientConfig};
 use bitcoin::{
     Transaction,
     consensus::{Decodable, Encodable},
@@ -11,6 +12,7 @@ use bitcoin::{
     },
 };
 use clap::{Parser, arg, command};
+use rand::seq::SliceRandom;
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -19,11 +21,14 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, lookup_host},
+    net::lookup_host,
     sync::Semaphore,
     task::JoinSet,
     time::sleep,
 };
+
+use tor_rtcompat::PreferredRuntime;
+
 use tracing::{error, info};
 
 const DNS_SEEDS: &[&str] = &[
@@ -37,6 +42,8 @@ const DNS_SEEDS: &[&str] = &[
 ];
 
 const NODE_LIBRE_RELAY: u64 = 1 << 29;
+const NODE_NETWORK: u64 = 1 << 0;
+const NODE_WITNESS: u64 = 1 << 3;
 const MAX_CONCURRENT_DELIVERIES: usize = 100;
 
 #[derive(Parser, Debug)]
@@ -50,6 +57,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
+
+    let config = TorClientConfig::default();
+    info!("Bootstrapping Tor client...");
+    let tor_client = Arc::new(TorClient::create_bootstrapped(config).await?);
 
     info!("time to blast some nodes with pigeon poop! 🕊️💩");
 
@@ -75,16 +86,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
-
     info!("found {} seed node addresses", seed_addrs.len());
+    seed_addrs.shuffle(&mut rand::thread_rng());
+
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
 
     let mut libre_peers = HashSet::<SocketAddr>::new();
     let mut crawl_tasks = JoinSet::new();
     for addr in seed_addrs {
         let permit = semaphore.clone().acquire_owned().await?;
+        let tor_client = tor_client.clone();
         crawl_tasks.spawn(async move {
-            let res = crawl_seed_node(addr).await;
+            let res = crawl_seed_node(addr, tor_client).await;
             drop(permit);
             res
         });
@@ -113,9 +126,10 @@ async fn main() -> Result<()> {
     for peer_addr in libre_peers.clone() {
         let tx_clone = tx.clone();
         let permit = semaphore.clone().acquire_owned().await?;
+        let tor_client = tor_client.clone();
         poop_delivery_tasks.spawn(async move {
             let _permit_guard = permit;
-            match deliver_poop_tx(peer_addr, tx_clone).await {
+            match deliver_poop_tx(peer_addr, tx_clone, tor_client).await {
                 Ok(true) => Ok(peer_addr),
                 Ok(false) => Err((
                     peer_addr,
@@ -163,35 +177,42 @@ async fn main() -> Result<()> {
 fn build_version_msg(addr: SocketAddr) -> VersionMessage {
     VersionMessage {
         version: 70016,
-        services: ServiceFlags::from(NODE_LIBRE_RELAY),
+        services: ServiceFlags::from(NODE_NETWORK | NODE_WITNESS | NODE_LIBRE_RELAY),
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64,
-        receiver: Address::new(&addr, ServiceFlags::NONE),
+        receiver: Address::new(&addr, ServiceFlags::from(NODE_NETWORK | NODE_LIBRE_RELAY)),
         sender: Address::new(
             &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            ServiceFlags::from(NODE_LIBRE_RELAY),
+            ServiceFlags::from(NODE_NETWORK | NODE_WITNESS | NODE_LIBRE_RELAY),
         ),
-        nonce: 420,
-        user_agent: "/Satoshi:25.0.0/".into(),
-        start_height: 1337,
+        nonce: rand::random::<u64>(),
+        user_agent: "/Satoshi:27.0.0/".into(),
+        start_height: 897157,
         relay: true,
     }
 }
 
-async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
-    let mut stream =
-        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                return Err(e.into());
-            }
-            Err(_) => {
-                return Err(anyhow::anyhow!("Timeout connecting to {}", addr));
-            }
-        };
-    stream.set_nodelay(true)?;
+async fn deliver_poop_tx(
+    addr: SocketAddr,
+    tx: Transaction,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<bool> {
+    let mut stream = match tokio::time::timeout(
+        Duration::from_secs(3),
+        tor_client.connect((addr.ip().to_string(), addr.port())),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(e.into());
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!("Timeout connecting to {}", addr));
+        }
+    };
 
     if let Err(e) = send_msg(
         &mut stream,
@@ -268,12 +289,7 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
         return Err(e);
     }
 
-    info!(
-        "Waiting for confirmation of TX from libre relay node {}",
-        addr
-    );
-
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(400)).await;
 
     if let Err(e) = send_msg(
         &mut wr,
@@ -291,8 +307,8 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
                 NetworkMessage::Tx(received_tx) => {
                     if received_tx.compute_txid() == tx.compute_txid() {
                         info!(
-                            "[CONFIRMED HIT] GETDATA returned TX: direct hit confirmed on libre node! poop deliverd to {}!",
-                            addr
+                            "[CONFIRMED HIT] GETDATA returned TX: direct hit confirmed on libre node! poop deliverd to {}! (UA: '{}')",
+                            addr, peer_version_message.user_agent
                         );
                         tx_confirmed_by_peer = true;
                         break;
@@ -307,15 +323,31 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
                         }
                     }) {
                         error!(
-                            "[NotFound] {} (UA: '{}', Services: {:?}) Possible LIAR detected! This node might be lying and tricking the code!! (If tx {} is already in a block, this is expected)",
+                            "[NotFound] {} (UA: '{}') Possible LIAR detected! This node might be lying and tricking the code!! (If tx {} is already in a block, this is expected)",
                             addr,
                             peer_version_message.user_agent,
-                            peer_version_message.services,
                             tx.compute_txid()
                         );
                         break;
                     }
                 }
+                NetworkMessage::Inv(inv_list) => {
+                    if inv_list.iter().any(|inv| {
+                        if let Inventory::Transaction(hash) = inv {
+                            *hash == tx.compute_txid()
+                        } else {
+                            false
+                        }
+                    }) {
+                        info!(
+                            "[CONFIRMED HIT] INV returned TX: direct hit confirmed on libre node! poop deliverd to {}! (UA: '{}')",
+                            addr, peer_version_message.user_agent
+                        );
+                        tx_confirmed_by_peer = true;
+                        break;
+                    }
+                }
+
                 _ => {}
             },
             Ok(Err(read_err)) => {
@@ -327,8 +359,8 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
             }
             Err(_) => {
                 error!(
-                    "Timeout waiting for Tx, Inv, or Reject from {} (UA: '{}', Services: {:?}. Possible LIAR detected!",
-                    addr, peer_version_message.user_agent, peer_version_message.services
+                    "Timeout waiting for Tx, Inv, or Reject from {} (UA: '{}'). Possible LIAR detected!",
+                    addr, peer_version_message.user_agent
                 );
                 break;
             }
@@ -337,15 +369,28 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
     Ok(tx_confirmed_by_peer)
 }
 
-async fn crawl_seed_node(seed: SocketAddr) -> Result<Vec<SocketAddr>> {
+async fn crawl_seed_node(
+    seed: SocketAddr,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<Vec<SocketAddr>> {
     let mut found_peers = Vec::new();
     info!("crawling seed {:?}", seed);
-    let mut stream =
-        match tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(seed)).await {
-            Ok(Ok(s)) => s,
-            _ => return Ok(found_peers),
-        };
-    stream.set_nodelay(true)?;
+    let mut stream = match tokio::time::timeout(
+        Duration::from_secs(3),
+        tor_client.connect((seed.ip().to_string(), seed.port())),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(e.into());
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!("Timeout connecting to {}", seed));
+        }
+    };
+
+    found_peers.shuffle(&mut rand::thread_rng());
 
     send_msg(
         &mut stream,
