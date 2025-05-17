@@ -4434,6 +4434,7 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "tokio",
+ "tor-rtcompat",
  "tracing",
  "tracing-subscriber",
 ]

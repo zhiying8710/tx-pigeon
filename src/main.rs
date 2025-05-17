@@ -1,4 +1,5 @@
 use anyhow::Result;
+use arti_client::{TorClient, TorClientConfig};
 use bitcoin::{
     Transaction,
     consensus::{Decodable, Encodable},
@@ -25,6 +26,9 @@ use tokio::{
     task::JoinSet,
     time::sleep,
 };
+
+use tor_rtcompat::PreferredRuntime;
+
 use tracing::{error, info};
 
 const DNS_SEEDS: &[&str] = &[
@@ -53,6 +57,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
+
+    let config = TorClientConfig::default();
+    info!("Bootstrapping Tor client...");
+    let tor_client = Arc::new(TorClient::create_bootstrapped(config).await?);
 
     info!("time to blast some nodes with pigeon poop! 🕊️💩");
 
@@ -117,9 +125,10 @@ async fn main() -> Result<()> {
     for peer_addr in libre_peers.clone() {
         let tx_clone = tx.clone();
         let permit = semaphore.clone().acquire_owned().await?;
+        let tor_client = tor_client.clone();
         poop_delivery_tasks.spawn(async move {
             let _permit_guard = permit;
-            match deliver_poop_tx(peer_addr, tx_clone).await {
+            match deliver_poop_tx(peer_addr, tx_clone, tor_client).await {
                 Ok(true) => Ok(peer_addr),
                 Ok(false) => Err((
                     peer_addr,
@@ -184,18 +193,25 @@ fn build_version_msg(addr: SocketAddr) -> VersionMessage {
     }
 }
 
-async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
-    let mut stream =
-        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                return Err(e.into());
-            }
-            Err(_) => {
-                return Err(anyhow::anyhow!("Timeout connecting to {}", addr));
-            }
-        };
-    stream.set_nodelay(true)?;
+async fn deliver_poop_tx(
+    addr: SocketAddr,
+    tx: Transaction,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<bool> {
+    let mut stream = match tokio::time::timeout(
+        Duration::from_secs(5),
+        tor_client.connect((addr.ip().to_string(), addr.port())),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(e.into());
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!("Timeout connecting to {}", addr));
+        }
+    };
 
     if let Err(e) = send_msg(
         &mut stream,
@@ -366,6 +382,8 @@ async fn crawl_seed_node(seed: SocketAddr) -> Result<Vec<SocketAddr>> {
             _ => return Ok(found_peers),
         };
     stream.set_nodelay(true)?;
+
+    found_peers.shuffle(&mut rand::thread_rng());
 
     send_msg(
         &mut stream,
