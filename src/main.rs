@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, lookup_host},
+    net::lookup_host,
     sync::Semaphore,
     task::JoinSet,
     time::sleep,
@@ -95,8 +95,9 @@ async fn main() -> Result<()> {
     let mut crawl_tasks = JoinSet::new();
     for addr in seed_addrs {
         let permit = semaphore.clone().acquire_owned().await?;
+        let tor_client = tor_client.clone();
         crawl_tasks.spawn(async move {
-            let res = crawl_seed_node(addr).await;
+            let res = crawl_seed_node(addr, tor_client).await;
             drop(permit);
             res
         });
@@ -199,7 +200,7 @@ async fn deliver_poop_tx(
     tor_client: Arc<TorClient<PreferredRuntime>>,
 ) -> Result<bool> {
     let mut stream = match tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(3),
         tor_client.connect((addr.ip().to_string(), addr.port())),
     )
     .await
@@ -288,12 +289,7 @@ async fn deliver_poop_tx(
         return Err(e);
     }
 
-    info!(
-        "Waiting for confirmation of TX from libre relay node {}",
-        addr
-    );
-
-    sleep(Duration::from_millis(800)).await;
+    sleep(Duration::from_millis(400)).await;
 
     if let Err(e) = send_msg(
         &mut wr,
@@ -373,15 +369,26 @@ async fn deliver_poop_tx(
     Ok(tx_confirmed_by_peer)
 }
 
-async fn crawl_seed_node(seed: SocketAddr) -> Result<Vec<SocketAddr>> {
+async fn crawl_seed_node(
+    seed: SocketAddr,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+) -> Result<Vec<SocketAddr>> {
     let mut found_peers = Vec::new();
     info!("crawling seed {:?}", seed);
-    let mut stream =
-        match tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(seed)).await {
-            Ok(Ok(s)) => s,
-            _ => return Ok(found_peers),
-        };
-    stream.set_nodelay(true)?;
+    let mut stream = match tokio::time::timeout(
+        Duration::from_secs(3),
+        tor_client.connect((seed.ip().to_string(), seed.port())),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(e.into());
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!("Timeout connecting to {}", seed));
+        }
+    };
 
     found_peers.shuffle(&mut rand::thread_rng());
 
