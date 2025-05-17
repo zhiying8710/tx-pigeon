@@ -104,6 +104,11 @@ async fn main() -> Result<()> {
         }
     }
 
+    info!(
+        "found {} addresses advertising the libre relay service flag",
+        libre_peers.len()
+    );
+
     let mut poop_delivery_tasks = JoinSet::new();
     for peer_addr in libre_peers.clone() {
         let tx_clone = tx.clone();
