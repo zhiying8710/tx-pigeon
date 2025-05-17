@@ -11,6 +11,7 @@ use bitcoin::{
     },
 };
 use clap::{Parser, arg, command};
+use rand::seq::SliceRandom;
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -37,6 +38,8 @@ const DNS_SEEDS: &[&str] = &[
 ];
 
 const NODE_LIBRE_RELAY: u64 = 1 << 29;
+const NODE_NETWORK: u64 = 1 << 0;
+const NODE_WITNESS: u64 = 1 << 3;
 const MAX_CONCURRENT_DELIVERIES: usize = 100;
 
 #[derive(Parser, Debug)]
@@ -75,9 +78,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
-
     info!("found {} seed node addresses", seed_addrs.len());
+    seed_addrs.shuffle(&mut rand::thread_rng());
+
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
 
     let mut libre_peers = HashSet::<SocketAddr>::new();
     let mut crawl_tasks = JoinSet::new();
@@ -163,19 +167,19 @@ async fn main() -> Result<()> {
 fn build_version_msg(addr: SocketAddr) -> VersionMessage {
     VersionMessage {
         version: 70016,
-        services: ServiceFlags::from(NODE_LIBRE_RELAY),
+        services: ServiceFlags::from(NODE_NETWORK | NODE_WITNESS | NODE_LIBRE_RELAY),
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64,
-        receiver: Address::new(&addr, ServiceFlags::NONE),
+        receiver: Address::new(&addr, ServiceFlags::from(NODE_NETWORK | NODE_LIBRE_RELAY)),
         sender: Address::new(
             &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            ServiceFlags::from(NODE_LIBRE_RELAY),
+            ServiceFlags::from(NODE_NETWORK | NODE_WITNESS | NODE_LIBRE_RELAY),
         ),
-        nonce: 420,
-        user_agent: "/Satoshi:25.0.0/".into(),
-        start_height: 1337,
+        nonce: rand::random::<u64>(),
+        user_agent: "/Satoshi:27.0.0/".into(),
+        start_height: 897157,
         relay: true,
     }
 }
@@ -273,7 +277,7 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
         addr
     );
 
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(800)).await;
 
     if let Err(e) = send_msg(
         &mut wr,
@@ -291,8 +295,8 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
                 NetworkMessage::Tx(received_tx) => {
                     if received_tx.compute_txid() == tx.compute_txid() {
                         info!(
-                            "[CONFIRMED HIT] GETDATA returned TX: direct hit confirmed on libre node! poop deliverd to {}!",
-                            addr
+                            "[CONFIRMED HIT] GETDATA returned TX: direct hit confirmed on libre node! poop deliverd to {}! (UA: '{}')",
+                            addr, peer_version_message.user_agent
                         );
                         tx_confirmed_by_peer = true;
                         break;
@@ -307,15 +311,31 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
                         }
                     }) {
                         error!(
-                            "[NotFound] {} (UA: '{}', Services: {:?}) Possible LIAR detected! This node might be lying and tricking the code!! (If tx {} is already in a block, this is expected)",
+                            "[NotFound] {} (UA: '{}') Possible LIAR detected! This node might be lying and tricking the code!! (If tx {} is already in a block, this is expected)",
                             addr,
                             peer_version_message.user_agent,
-                            peer_version_message.services,
                             tx.compute_txid()
                         );
                         break;
                     }
                 }
+                NetworkMessage::Inv(inv_list) => {
+                    if inv_list.iter().any(|inv| {
+                        if let Inventory::Transaction(hash) = inv {
+                            *hash == tx.compute_txid()
+                        } else {
+                            false
+                        }
+                    }) {
+                        info!(
+                            "[CONFIRMED HIT] INV returned TX: direct hit confirmed on libre node! poop deliverd to {}! (UA: '{}')",
+                            addr, peer_version_message.user_agent
+                        );
+                        tx_confirmed_by_peer = true;
+                        break;
+                    }
+                }
+
                 _ => {}
             },
             Ok(Err(read_err)) => {
@@ -327,8 +347,8 @@ async fn deliver_poop_tx(addr: SocketAddr, tx: Transaction) -> Result<bool> {
             }
             Err(_) => {
                 error!(
-                    "Timeout waiting for Tx, Inv, or Reject from {} (UA: '{}', Services: {:?}. Possible LIAR detected!",
-                    addr, peer_version_message.user_agent, peer_version_message.services
+                    "Timeout waiting for Tx, Inv, or Reject from {} (UA: '{}'). Possible LIAR detected!",
+                    addr, peer_version_message.user_agent
                 );
                 break;
             }
