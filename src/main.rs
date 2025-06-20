@@ -1,5 +1,12 @@
 use anyhow::Result;
 use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::Json,
+    routing::{get, post},
+    Router,
+};
 use bitcoin::{
     Transaction,
     consensus::{Decodable, Encodable},
@@ -13,11 +20,9 @@ use bitcoin::{
     },
 };
 
-use clap::{Parser, arg, command};
 use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
-use tor_rtcompat::PreferredRuntime;
-
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -31,6 +36,7 @@ use tokio::{
     task::JoinSet,
     time::timeout,
 };
+use tower_http::cors::CorsLayer;
 
 use data_encoding::BASE32_NOPAD;
 use tracing::{error, info};
@@ -60,23 +66,181 @@ enum NetworkAddress {
     Onion(String),
 }
 
-#[derive(Parser, Debug)]
-#[command(author, version, about)]
-struct Args {
-    /// Hex-encoded raw transaction you’d like to blast
-    #[arg(long)]
+#[derive(Debug, Serialize, Deserialize)]
+struct BroadcastRequest {
     tx: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BroadcastResponse {
+    success: bool,
+    message: String,
+    txid: String,
+    success_count: usize,
+    total_peers: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+#[derive(Clone)]
+struct AppState {
+    tor_client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
 
-    let args = Args::parse();
-    let tx_hex_string = args.tx;
-    let tx = bitcoin::consensus::deserialize::<Transaction>(&hex::decode(tx_hex_string)?)?;
-    let txid = tx.compute_txid();
+    info!("Starting tx-pigeon HTTP server...");
 
+    // Initialize Tor client
+    info!("Bootstrapping Tor client...");
+    let config = TorClientConfig::builder().build()?;
+    let tor_client = Arc::new(TorClient::create_bootstrapped(config).await?);
+
+    let state = AppState { tor_client };
+
+    // Configure CORS
+    let cors = CorsLayer::permissive();
+
+    // Build our application with a route
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .route("/broadcast", post(broadcast_transaction))
+        .layer(cors)
+        .with_state(state);
+
+    // Run it
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    info!("tx-pigeon HTTP server listening on http://127.0.0.1:3000");
+    
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+#[axum::debug_handler]
+async fn health_check() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "healthy",
+        "service": "tx-pigeon",
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
+#[axum::debug_handler]
+async fn broadcast_transaction(
+    State(state): State<AppState>,
+    Json(payload): Json<BroadcastRequest>,
+) -> Result<Json<BroadcastResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tx_hex_string = payload.tx;
+    
+    // Parse transaction
+    let tx = match hex::decode(&tx_hex_string) {
+        Ok(tx_bytes) => {
+            match bitcoin::consensus::deserialize::<Transaction>(&tx_bytes) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: format!("Invalid transaction format: {}", e),
+                        }),
+                    ));
+                }
+            }
+        },
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid hex string: {}", e),
+                }),
+            ));
+        }
+    };
+    
+    let txid = tx.compute_txid();
+    let txid_hex = txid.to_string();
+
+    info!("Received broadcast request for tx: {}", txid_hex);
+
+    // Discover seed addresses
+    let seed_addrs = match discover_seed_addresses().await {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to discover seed addresses: {}", e),
+                }),
+            ));
+        }
+    };
+
+    info!("Found {} seed node addresses", seed_addrs.len());
+
+    // Discover libre relay peers
+    let libre_peers = match discover_libre_peers(seed_addrs).await {
+        Ok(peers) => peers,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to discover libre relay peers: {}", e),
+                }),
+            ));
+        }
+    };
+
+    info!(
+        "Found {} addresses advertising the libre relay service flag",
+        libre_peers.len()
+    );
+
+    if libre_peers.is_empty() {
+        return Ok(Json(BroadcastResponse {
+            success: false,
+            message: "No libre relay nodes found".to_string(),
+            txid: txid_hex,
+            success_count: 0,
+            total_peers: 0,
+        }));
+    }
+
+    // Broadcast transaction
+    let success_count = match broadcast_to_peers(libre_peers.clone(), tx, state.tor_client.clone()).await {
+        Ok(count) => count,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to broadcast transaction: {}", e),
+                }),
+            ));
+        }
+    };
+
+    let success = success_count > 0;
+    let message = if success {
+        format!("Transaction broadcasted to {} libre relay nodes", success_count)
+    } else {
+        "No libre relay nodes accepted the transaction. TX may already be in a block or is invalid.".to_string()
+    };
+
+    Ok(Json(BroadcastResponse {
+        success,
+        message,
+        txid: txid_hex,
+        success_count,
+        total_peers: libre_peers.len(),
+    }))
+}
+
+async fn discover_seed_addresses() -> Result<Vec<SocketAddr>> {
     let mut seed_addrs = Vec::new();
     let mut seed_tasks = JoinSet::new();
 
@@ -117,19 +281,16 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("found {} seed node addresses", seed_addrs.len());
     seed_addrs.shuffle(&mut rand::rng());
+    Ok(seed_addrs)
+}
 
-    info!("time to blast some nodes with pigeon poop! 🐦💩");
-
-    info!("blasting tx {:?} to libre relay nodes...", txid);
-
+async fn discover_libre_peers(seed_addrs: Vec<SocketAddr>) -> Result<HashSet<NetworkAddress>> {
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
-
     let mut libre_peers = HashSet::<NetworkAddress>::new();
     let mut crawl_tasks = JoinSet::new();
 
-    for addr in seed_addrs.clone() {
+    for addr in seed_addrs {
         crawl_tasks.spawn({
             let sem = semaphore.clone();
             async move {
@@ -153,22 +314,21 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!(
-        "found {} addresses advertising the libre relay service flag",
-        libre_peers.len()
-    );
+    Ok(libre_peers)
+}
 
-    //connect to tor
-    info!("Bootstrapping Tor client...");
-    let config = TorClientConfig::builder().build()?;
-    let tor_client = Arc::new(TorClient::create_bootstrapped(config).await?);
-
+async fn broadcast_to_peers(
+    libre_peers: HashSet<NetworkAddress>,
+    tx: Transaction,
+    tor_client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
+) -> Result<usize> {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
     let common_token = IsolationToken::no_isolation();
     let mut prefs = StreamPrefs::new();
     prefs.set_isolation(common_token);
 
     let mut poop_delivery_tasks = JoinSet::new();
-    for peer_addr in libre_peers.clone() {
+    for peer_addr in libre_peers {
         let tx_clone = tx.clone();
         let permit = semaphore.clone().acquire_owned().await?;
         let tor_client = tor_client.clone();
@@ -204,20 +364,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    if success_count == 0 {
-        error!(
-            "No libre relay nodes accepted the transaction. TX {} may already be in a block or its invalid.",
-            txid
-        );
-        return Ok(());
-    }
-
-    info!(
-        "TX: {:?} blasted to {} libre relay nodes. GLHF",
-        txid, success_count,
-    );
-
-    Ok(())
+    Ok(success_count)
 }
 
 fn build_version_msg() -> VersionMessage {
@@ -246,7 +393,7 @@ fn build_version_msg() -> VersionMessage {
 async fn deliver_poop_tx(
     addr: NetworkAddress,
     tx: Transaction,
-    tor_client: Arc<TorClient<PreferredRuntime>>,
+    tor_client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
     prefs: StreamPrefs,
 ) -> Result<bool> {
     let txid = tx.compute_txid();
