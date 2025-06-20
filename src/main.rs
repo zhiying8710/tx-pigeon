@@ -27,12 +27,12 @@ use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::lookup_host,
-    sync::Semaphore,
+    sync::{Semaphore, RwLock},
     task::JoinSet,
     time::timeout,
 };
@@ -59,6 +59,7 @@ const NODE_NETWORK: u64 = 1 << 0;
 const NODE_WITNESS: u64 = 1 << 3;
 const MAX_CONCURRENT_DELIVERIES: usize = 100;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(12);
+const NODE_CACHE_DURATION: Duration = Duration::from_secs(300); // 5分钟缓存
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum NetworkAddress {
@@ -88,6 +89,26 @@ struct ErrorResponse {
 #[derive(Clone)]
 struct AppState {
     tor_client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
+    peer_cache: Arc<RwLock<Option<CachedPeers>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPeers {
+    peers: HashSet<NetworkAddress>,
+    last_updated: Instant,
+}
+
+impl CachedPeers {
+    fn new(peers: HashSet<NetworkAddress>) -> Self {
+        Self {
+            peers,
+            last_updated: Instant::now(),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.last_updated.elapsed() > NODE_CACHE_DURATION
+    }
 }
 
 #[tokio::main]
@@ -101,7 +122,10 @@ async fn main() -> Result<()> {
     let config = TorClientConfig::builder().build()?;
     let tor_client = Arc::new(TorClient::create_bootstrapped(config).await?);
 
-    let state = AppState { tor_client };
+    let state = AppState {
+        tor_client,
+        peer_cache: Arc::new(RwLock::new(None)),
+    };
 
     // Configure CORS
     let cors = CorsLayer::permissive();
@@ -110,6 +134,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/broadcast", post(broadcast_transaction))
+        .route("/cache/clear", post(clear_cache))
         .layer(cors)
         .with_state(state);
 
@@ -138,68 +163,31 @@ async fn broadcast_transaction(
 ) -> Result<Json<BroadcastResponse>, (StatusCode, Json<ErrorResponse>)> {
     let tx_hex_string = payload.tx;
     
-    // Parse transaction
-    let tx = match hex::decode(&tx_hex_string) {
-        Ok(tx_bytes) => {
-            match bitcoin::consensus::deserialize::<Transaction>(&tx_bytes) {
-                Ok(tx) => tx,
-                Err(e) => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: format!("Invalid transaction format: {}", e),
-                        }),
-                    ));
-                }
-            }
+    // 并行处理：交易解析和节点发现
+    let (tx, libre_peers) = tokio::try_join!(
+        async {
+            // Parse transaction
+            let tx_bytes = hex::decode(&tx_hex_string)
+                .map_err(|e| anyhow::anyhow!("Invalid hex string: {}", e))?;
+            
+            bitcoin::consensus::deserialize::<Transaction>(&tx_bytes)
+                .map_err(|e| anyhow::anyhow!("Invalid transaction format: {}", e))
         },
-        Err(e) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("Invalid hex string: {}", e),
-                }),
-            ));
-        }
-    };
+        get_or_discover_libre_peers(&state)
+    ).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
     
     let txid = tx.compute_txid();
     let txid_hex = txid.to_string();
 
     info!("Received broadcast request for tx: {}", txid_hex);
-
-    // Discover seed addresses
-    let seed_addrs = match discover_seed_addresses().await {
-        Ok(addrs) => addrs,
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to discover seed addresses: {}", e),
-                }),
-            ));
-        }
-    };
-
-    info!("Found {} seed node addresses", seed_addrs.len());
-
-    // Discover libre relay peers
-    let libre_peers = match discover_libre_peers(seed_addrs).await {
-        Ok(peers) => peers,
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to discover libre relay peers: {}", e),
-                }),
-            ));
-        }
-    };
-
-    info!(
-        "Found {} addresses advertising the libre relay service flag",
-        libre_peers.len()
-    );
+    info!("Found {} libre relay peers", libre_peers.len());
 
     if libre_peers.is_empty() {
         return Ok(Json(BroadcastResponse {
@@ -212,17 +200,16 @@ async fn broadcast_transaction(
     }
 
     // Broadcast transaction
-    let success_count = match broadcast_to_peers(libre_peers.clone(), tx, state.tor_client.clone()).await {
-        Ok(count) => count,
-        Err(e) => {
-            return Err((
+    let success_count = broadcast_to_peers(libre_peers.clone(), tx, state.tor_client.clone())
+        .await
+        .map_err(|e| {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: format!("Failed to broadcast transaction: {}", e),
                 }),
-            ));
-        }
-    };
+            )
+        })?;
 
     let success = success_count > 0;
     let message = if success {
@@ -659,4 +646,44 @@ fn tor_v3_onion_from_pubkey(pubkey: &[u8; 32]) -> String {
     addr_raw.push(0x03);
 
     BASE32_NOPAD.encode(&addr_raw).to_lowercase() + ".onion"
+}
+
+async fn get_or_discover_libre_peers(state: &AppState) -> Result<HashSet<NetworkAddress>> {
+    // 检查缓存
+    {
+        let cache = state.peer_cache.read().await;
+        if let Some(cached) = &*cache {
+            if !cached.is_expired() {
+                info!("Using cached peers: {}", cached.peers.len());
+                return Ok(cached.peers.clone());
+            }
+        }
+    }
+
+    // 缓存过期或不存在，重新发现节点
+    info!("Cache expired or empty, discovering new peers...");
+    
+    let seed_addrs = discover_seed_addresses().await?;
+    let libre_peers = discover_libre_peers(seed_addrs).await?;
+    
+    // 更新缓存
+    {
+        let mut cache = state.peer_cache.write().await;
+        *cache = Some(CachedPeers::new(libre_peers.clone()));
+    }
+    
+    Ok(libre_peers)
+}
+
+#[axum::debug_handler]
+async fn clear_cache(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let mut cache = state.peer_cache.write().await;
+    *cache = None;
+    
+    Json(serde_json::json!({
+        "success": true,
+        "message": "Peer cache cleared successfully"
+    }))
 }
